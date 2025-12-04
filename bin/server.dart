@@ -1,520 +1,719 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
-import 'package:uuid/uuid.dart';
-import 'package:game_server/models.dart' show
-  GameInstance,
-  GameEvent,
-  PlayerState,
-  PlayerStatus,
-  ClientRole,
-  generateId;
+/// Запуск:
+/// dart run bin/server.dart
+///
+/// WebSocket endpoint: ws://0.0.0.0:8080/ws
 
-final Uuid _uuid = Uuid();
+final _rnd = Random();
 
-class ClientConnection {
-  final String id;
+/// Максимальный номер клетки (длина поля)
+const int kBoardMaxCell = 43;
+
+/// ===== МОДЕЛИ ДАННЫХ =====
+
+class Host {
+  String id;          // 6-символьный код A-Z0-9
+  String name;
+  String status;      // 'active' / 'locked'
+  int gamesCount;
+
+  Host({
+    required this.id,
+    required this.name,
+    required this.status,
+    required this.gamesCount,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'status': status,
+        'gamesCount': gamesCount,
+      };
+}
+
+class PlayerState {
+  String id;           // строковый id игрока внутри игры
+  String name;
+  int position;        // номер клетки
+  int pearls;          // Жемчужины
+  int amulets;         // Амулеты
+  String status;       // 'active', 'waiting', 'finished', 'sleeping'
+
+  PlayerState({
+    required this.id,
+    required this.name,
+    required this.position,
+    required this.pearls,
+    required this.amulets,
+    required this.status,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'position': position,
+        'pearls': pearls,
+        'amulets': amulets,
+        'status': status,
+      };
+}
+
+class GameRoom {
+  String id;             // внутренний ID (uuid-like или счётчик)
+  String code;           // читаемый код игры (для ведущего/участниц)
+  String templateId;     // 'happy_from_proper'
+  String? hostId;        // id ведущего
+  String status;         // 'active' / 'finished'
+  int turnNumber;
+  String? currentPlayerId;
+  DateTime startedAt;
+  DateTime? finishedAt;
+
+  final List<PlayerState> players = [];
+
+  GameRoom({
+    required this.id,
+    required this.code,
+    required this.templateId,
+    required this.status,
+    required this.turnNumber,
+    required this.startedAt,
+    this.hostId,
+    this.currentPlayerId,
+    this.finishedAt,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'code': code,
+        'templateId': templateId,
+        'hostId': hostId,
+        'status': status,
+        'turnNumber': turnNumber,
+        'currentPlayerId': currentPlayerId,
+        'startedAt': startedAt.toUtc().toIso8601String(),
+        'finishedAt': finishedAt?.toUtc().toIso8601String(),
+        'players': players.map((p) => p.toJson()).toList(),
+      };
+}
+
+class ClientSession {
+  final int id;
   final WebSocket socket;
-  String? gameId;
-  ClientRole? role;
-  String? playerId; // если это участница
 
-  ClientConnection({
+  /// 'creator' | 'host' | 'player' | 'screen' (на будущее)
+  String role;
+
+  String? hostId;      // если ведущий или связанный экран
+  String? gameCode;    // код игры, к которой привязан клиент
+  String? playerId;    // если клиент — участник конкретной игры
+
+  ClientSession({
     required this.id,
     required this.socket,
+    required this.role,
+    this.hostId,
+    this.gameCode,
+    this.playerId,
   });
 }
 
-// Хранилище в памяти
-final Map<String, GameInstance> games = {};   // gameId -> GameInstance
-final Map<String, ClientConnection> clients = {}; // clientId -> ClientConnection
+/// ===== ГЛОБАЛЬНОЕ СОСТОЯНИЕ СЕРВЕРА (в памяти) =====
+
+final Map<String, Host> _hosts = {};           // hostId -> Host
+final Map<String, GameRoom> _gamesByCode = {}; // gameCode -> GameRoom
+final Map<String, GameRoom> _gamesById = {};   // gameId   -> GameRoom
+final Map<int, ClientSession> _sessions = {};  // sessionId -> ClientSession
+
+int _nextSessionId = 1;
+int _nextGameId = 1;
+int _nextPlayerIdx = 1;
+
+/// время последнего входа Создателя (общая)
+DateTime? _creatorLastLogin;
+
+/// ===== УТИЛИТЫ =====
+
+String _randomCode(int length) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  return List.generate(length, (_) => chars[_rnd.nextInt(chars.length)]).join();
+}
+
+String _newGameId() => 'G${_nextGameId++}';
+
+String _newPlayerId() => 'P${_nextPlayerIdx++}';
+
+ClientSession _registerSession(WebSocket socket) {
+  final session = ClientSession(
+    id: _nextSessionId++,
+    socket: socket,
+    role: 'guest',
+  );
+  _sessions[session.id] = session;
+  print('[SESSION ${session.id}] connected');
+  return session;
+}
+
+void _removeSession(ClientSession session) {
+  _sessions.remove(session.id);
+  print('[SESSION ${session.id}] disconnected');
+}
+
+/// Отправка сообщения одному клиенту
+void _sendToSession(ClientSession session, String type, Map<String, dynamic> payload) {
+  final msg = jsonEncode({
+    'type': type,
+    'payload': payload,
+  });
+  session.socket.add(msg);
+}
+
+/// Широковещательный room_state всем клиентам, привязанным к этой игре
+void _broadcastRoomState(GameRoom room) {
+  final msg = jsonEncode({
+    'type': 'room_state',
+    'payload': room.toJson(),
+  });
+
+  for (final s in _sessions.values) {
+    if (s.gameCode == room.code) {
+      s.socket.add(msg);
+    }
+  }
+}
+
+/// Шлем всем создателям актуальное состояние ведущих
+void _broadcastCreatorState() {
+  final payload = {
+    'hosts': _hosts.values.map((h) => h.toJson()).toList(),
+    'lastLogin': _creatorLastLogin?.toUtc().toIso8601String(),
+  };
+
+  final msg = jsonEncode({
+    'type': 'creator_state',
+    'payload': payload,
+  });
+
+  for (final s in _sessions.values) {
+    if (s.role == 'creator') {
+      s.socket.add(msg);
+    }
+  }
+}
+
+/// Отправляем конкретному ведущему список его игр
+void _sendHostGames(ClientSession session, String hostId) {
+  final active = <Map<String, dynamic>>[];
+  final finished = <Map<String, dynamic>>[];
+
+  for (final room in _gamesByCode.values) {
+    if (room.hostId != hostId) continue;
+
+    final base = {
+      'id': room.id,
+      'code': room.code,
+      'playerCount': room.players.length,
+      'startedAt': room.startedAt.toUtc().toIso8601String(),
+      'finishedAt': room.finishedAt?.toUtc().toIso8601String(),
+    };
+
+    if (room.status == 'active') {
+      active.add(base);
+    } else {
+      finished.add(base);
+    }
+  }
+
+  _sendToSession(session, 'host_games', {
+    'active': active,
+    'finished': finished,
+  });
+}
+
+/// ===== ОБРАБОТЧИКИ КОМАНД =====
+
+void _handleLoginCreator(ClientSession session, Map<String, dynamic> payload) {
+  session.role = 'creator';
+  _creatorLastLogin = DateTime.now().toUtc();
+
+  _sendToSession(session, 'creator_state', {
+    'hosts': _hosts.values.map((h) => h.toJson()).toList(),
+    'lastLogin': _creatorLastLogin!.toIso8601String(),
+  });
+}
+
+void _handleListHosts(ClientSession session, Map<String, dynamic> payload) {
+  _sendToSession(session, 'creator_state', {
+    'hosts': _hosts.values.map((h) => h.toJson()).toList(),
+    'lastLogin': _creatorLastLogin?.toIso8601String(),
+  });
+}
+
+/// Создание нового ведущего
+void _handleCreateHost(ClientSession session, Map<String, dynamic> payload) {
+  final id = (payload['id'] ?? '').toString().toUpperCase();
+  final name = (payload['name'] ?? '').toString().trim();
+
+  if (id.isEmpty || name.isEmpty) {
+    _sendError(session, 'id и name обязательны для create_host');
+    return;
+  }
+
+  if (_hosts.containsKey(id)) {
+    _sendError(session, 'Ведущий с таким id уже существует: $id');
+    return;
+  }
+
+  final host = Host(
+    id: id,
+    name: name,
+    status: 'active',
+    gamesCount: 0,
+  );
+  _hosts[id] = host;
+
+  print('[CREATOR] created host $id ($name)');
+  _broadcastCreatorState();
+}
+
+/// Обновление ведущего (статус и т.п.)
+void _handleUpdateHost(ClientSession session, Map<String, dynamic> payload) {
+  final id = (payload['id'] ?? '').toString().toUpperCase();
+  final host = _hosts[id];
+  if (host == null) {
+    _sendError(session, 'Нет ведущего с id=$id');
+    return;
+  }
+
+  final status = payload['status']?.toString();
+  if (status != null && (status == 'active' || status == 'locked')) {
+    host.status = status;
+  }
+
+  print('[CREATOR] update host $id: status=${host.status}');
+  _broadcastCreatorState();
+}
+
+/// Удаление ведущего
+void _handleDeleteHost(ClientSession session, Map<String, dynamic> payload) {
+  final id = (payload['id'] ?? '').toString().toUpperCase();
+  if (!_hosts.containsKey(id)) {
+    _sendError(session, 'Нет ведущего с id=$id');
+    return;
+  }
+
+  _hosts.remove(id);
+  print('[CREATOR] delete host $id');
+  _broadcastCreatorState();
+}
+
+/// Логин ведущего
+void _handleLoginHost(ClientSession session, Map<String, dynamic> payload) {
+  final hostId = (payload['hostId'] ?? '').toString().toUpperCase();
+  final host = _hosts[hostId];
+
+  if (host == null) {
+    _sendError(session, 'Ведущий с id=$hostId не найден');
+    return;
+  }
+  if (host.status != 'active') {
+    _sendError(session, 'Ведущий $hostId заблокирован (status=${host.status})');
+    return;
+  }
+
+  session.role = 'host';
+  session.hostId = hostId;
+  print('[HOST ${session.id}] logged in as $hostId');
+
+  _sendHostGames(session, hostId);
+}
+
+/// Список игр ведущего
+void _handleHostGamesRequest(ClientSession session, Map<String, dynamic> payload) {
+  final hostId = (payload['hostId'] ?? '').toString().toUpperCase();
+  if (hostId.isEmpty) {
+    _sendError(session, 'hostId обязателен для host_games');
+    return;
+  }
+  _sendHostGames(session, hostId);
+}
+
+/// Создание игры
+void _handleCreateGame(ClientSession session, Map<String, dynamic> payload) {
+  final templateId = (payload['templateId'] ?? '').toString();
+  final hostId = (payload['hostId'] ?? '').toString().toUpperCase();
+
+  if (templateId.isEmpty) {
+    _sendError(session, 'templateId обязателен для create_game');
+    return;
+  }
+
+  Host? host;
+  if (hostId.isNotEmpty) {
+    host = _hosts[hostId];
+    if (host == null) {
+      _sendError(session, 'Ведущий с id=$hostId не найден');
+      return;
+    }
+    if (host.status != 'active') {
+      _sendError(session, 'Ведущий $hostId заблокирован');
+      return;
+    }
+  }
+
+  // генерим уникальный код игры
+  String code;
+  do {
+    code = _randomCode(6);
+  } while (_gamesByCode.containsKey(code));
+
+  final gameId = _newGameId();
+  final room = GameRoom(
+    id: gameId,
+    code: code,
+    templateId: templateId,
+    status: 'active',
+    turnNumber: 0,
+    startedAt: DateTime.now().toUtc(),
+    hostId: hostId.isEmpty ? null : hostId,
+  );
+
+  _gamesByCode[code] = room;
+  _gamesById[gameId] = room;
+
+  if (host != null) {
+    host.gamesCount += 1;
+    _broadcastCreatorState(); // обновим статистику ведущих
+  }
+
+  print('[GAME] created $code (id=$gameId, hostId=${room.hostId})');
+
+  _sendToSession(session, 'game_created', {
+    'id': gameId,
+    'code': code,
+    'hostId': room.hostId,
+  });
+}
+
+/// Ведущий подключается к игре
+void _handleJoinAsHost(ClientSession session, Map<String, dynamic> payload) {
+  final code = (payload['code'] ?? '').toString().toUpperCase();
+  if (code.isEmpty) {
+    _sendError(session, 'code обязателен для join_as_host');
+    return;
+  }
+  final room = _gamesByCode[code];
+  if (room == null) {
+    _sendError(session, 'Игра с кодом $code не найдена');
+    return;
+  }
+
+  final hostId = (payload['hostId'] ?? '').toString().toUpperCase();
+  if (room.hostId != null && hostId.isNotEmpty && room.hostId != hostId) {
+    _sendError(session, 'Эта игра закреплена за другим ведущим (hostId=${room.hostId})');
+    return;
+  }
+
+  session.role = 'host';
+  session.hostId = hostId.isNotEmpty ? hostId : room.hostId;
+  session.gameCode = code;
+
+  print('[HOST ${session.id}] joined game $code');
+
+  _broadcastRoomState(room);
+}
+
+/// Участница подключается к игре
+void _handleJoinAsPlayer(ClientSession session, Map<String, dynamic> payload) {
+  final code = (payload['code'] ?? '').toString().toUpperCase();
+  final name = (payload['name'] ?? '').toString().trim().isEmpty
+      ? 'Участница'
+      : (payload['name'] ?? '').toString().trim();
+
+  final room = _gamesByCode[code];
+  if (room == null) {
+    _sendError(session, 'Игра с кодом $code не найдена');
+    return;
+  }
+  if (room.status != 'active') {
+    _sendError(session, 'Игра $code уже завершена');
+    return;
+  }
+
+  final playerId = _newPlayerId();
+  final player = PlayerState(
+    id: playerId,
+    name: name,
+    position: 1,
+    pearls: 0,
+    amulets: 0,
+    status: 'waiting',
+  );
+  room.players.add(player);
+
+  // Если не было активного игрока — делаем первую участницу активной
+  room.currentPlayerId ??= player.id;
+
+  session.role = 'player';
+  session.gameCode = code;
+  session.playerId = playerId;
+
+  print('[PLAYER ${session.id}] "$name" joined game $code as $playerId');
+
+  _broadcastRoomState(room);
+}
+
+/// Завершение игры ведущим
+void _handleFinishGame(ClientSession session, Map<String, dynamic> payload) {
+  final code = (payload['code'] ?? '').toString().toUpperCase();
+  if (code.isEmpty) {
+    _sendError(session, 'code обязателен для finish_game');
+    return;
+  }
+  final room = _gamesByCode[code];
+  if (room == null) {
+    _sendError(session, 'Игра с кодом $code не найдена');
+    return;
+  }
+
+  room.status = 'finished';
+  room.finishedAt = DateTime.now().toUtc();
+
+  print('[GAME] finished $code');
+
+  _broadcastRoomState(room);
+}
+
+/// Переход хода
+void _handleNextTurn(ClientSession session, Map<String, dynamic> payload) {
+  final code = session.gameCode;
+  if (code == null) {
+    _sendError(session, 'Сессия не привязана к игре (next_turn)');
+    return;
+  }
+  final room = _gamesByCode[code];
+  if (room == null) {
+    _sendError(session, 'Игра с кодом $code не найдена');
+    return;
+  }
+  if (room.players.isEmpty) {
+    _sendError(session, 'В игре $code пока нет участников');
+    return;
+  }
+
+  // текущий индекс
+  int idx = 0;
+  if (room.currentPlayerId != null) {
+    final currentIndex = room.players.indexWhere((p) => p.id == room.currentPlayerId);
+    idx = currentIndex < 0 ? 0 : currentIndex;
+  }
+
+  // ищем следующего игрока (по кругу)
+  int attempts = 0;
+  do {
+    idx = (idx + 1) % room.players.length;
+    attempts++;
+    if (attempts > room.players.length + 2) break;
+  } while (room.players[idx].status == 'finished');
+
+  room.currentPlayerId = room.players[idx].id;
+  room.turnNumber += 1;
+
+  print('[GAME $code] next_turn => player=${room.currentPlayerId}');
+
+  _broadcastRoomState(room);
+}
+
+/// Авто-бросок кубика
+void _handleRollDiceAuto(ClientSession session, Map<String, dynamic> payload) {
+  final value = _rnd.nextInt(6) + 1;
+  _advanceCurrentPlayer(session, value, source: 'auto');
+}
+
+/// Ручной бросок кубика
+void _handleRollDiceManual(ClientSession session, Map<String, dynamic> payload) {
+  final v = payload['value'];
+  final value = v is int ? v : int.tryParse(v?.toString() ?? '');
+  if (value == null || value < 1 || value > 6) {
+    _sendError(session, 'Некорректное значение кубика: $v');
+    return;
+  }
+  _advanceCurrentPlayer(session, value, source: 'manual');
+}
+
+/// Движение текущей участницы вперёд на value
+void _advanceCurrentPlayer(ClientSession session, int value, {required String source}) {
+  final code = session.gameCode;
+  if (code == null) {
+    _sendError(session, 'Сессия не привязана к игре (roll_dice_$source)');
+    return;
+  }
+  final room = _gamesByCode[code];
+  if (room == null) {
+    _sendError(session, 'Игра с кодом $code не найдена');
+    return;
+  }
+  if (room.currentPlayerId == null) {
+    _sendError(session, 'В игре $code нет активной участницы');
+    return;
+  }
+
+  final player = room.players.firstWhere(
+    (p) => p.id == room.currentPlayerId,
+    orElse: () => room.players.first,
+  );
+
+  final oldPos = player.position;
+  var newPos = oldPos + value;
+  if (newPos > kBoardMaxCell) newPos = kBoardMaxCell;
+  player.position = newPos;
+
+  if (newPos >= kBoardMaxCell) {
+    player.status = 'finished';
+  }
+
+  print('[GAME $code] $source dice: player=${player.id} $oldPos -> $newPos');
+
+  _broadcastRoomState(room);
+}
+
+/// Добавление текстового комментария (лог) — пока просто печатаем в консоль
+void _handleAddComment(ClientSession session, Map<String, dynamic> payload) {
+  final text = (payload['text'] ?? '').toString();
+  final code = session.gameCode ?? 'NO_GAME';
+
+  print('[COMMENT][$code] $text');
+}
+
+/// ===== ОТПРАВКА ОШИБОК =====
+
+void _sendError(ClientSession session, String message) {
+  final payload = {
+    'message': message,
+  };
+  final msg = jsonEncode({
+    'type': 'error',
+    'payload': payload,
+  });
+  session.socket.add(msg);
+  print('[ERROR to session ${session.id}] $message');
+}
+
+/// ===== WS-ОБРАБОТЧИК =====
+
+void _handleWsClient(WebSocket socket) {
+  final session = _registerSession(socket);
+
+  socket.listen(
+    (data) {
+      try {
+        final decoded = jsonDecode(data as String);
+        if (decoded is! Map) return;
+        final type = decoded['type']?.toString();
+        final payload =
+            decoded['payload'] is Map ? Map<String, dynamic>.from(decoded['payload']) : <String, dynamic>{};
+
+        if (type == null) return;
+
+        switch (type) {
+          case 'login_creator':
+            _handleLoginCreator(session, payload);
+            break;
+          case 'list_hosts':
+            _handleListHosts(session, payload);
+            break;
+          case 'create_host':
+            _handleCreateHost(session, payload);
+            break;
+          case 'update_host':
+            _handleUpdateHost(session, payload);
+            break;
+          case 'delete_host':
+            _handleDeleteHost(session, payload);
+            break;
+          case 'login_host':
+            _handleLoginHost(session, payload);
+            break;
+          case 'host_games':
+            _handleHostGamesRequest(session, payload);
+            break;
+          case 'create_game':
+            _handleCreateGame(session, payload);
+            break;
+          case 'join_as_host':
+            _handleJoinAsHost(session, payload);
+            break;
+          case 'join_as_player':
+            _handleJoinAsPlayer(session, payload);
+            break;
+          case 'finish_game':
+            _handleFinishGame(session, payload);
+            break;
+          case 'next_turn':
+            _handleNextTurn(session, payload);
+            break;
+          case 'roll_dice_auto':
+            _handleRollDiceAuto(session, payload);
+            break;
+          case 'roll_dice_manual':
+            _handleRollDiceManual(session, payload);
+            break;
+          case 'add_comment':
+            _handleAddComment(session, payload);
+            break;
+          default:
+            _sendError(session, 'Неизвестный тип сообщения: $type');
+        }
+      } catch (e, st) {
+        print('[SESSION ${session.id}] json error: $e\n$st');
+        _sendError(session, 'Ошибка парсинга сообщения: $e');
+      }
+    },
+    onDone: () {
+      _removeSession(session);
+    },
+    onError: (err) {
+      print('[SESSION ${session.id}] socket error: $err');
+      _removeSession(session);
+    },
+  );
+}
+
+/// ===== MAIN =====
 
 Future<void> main(List<String> args) async {
-  final portEnv = Platform.environment['PORT'];
-  final port = portEnv != null ? int.tryParse(portEnv) ?? 8080 : 8080;
+  final port = args.isNotEmpty ? int.tryParse(args.first) ?? 8080 : 8080;
 
-  final server = await HttpServer.bind(InternetAddress.anyIPv4, port);
-  print('Game server running on port $port');
+  final server = await HttpServer.bind(
+    InternetAddress.anyIPv4,
+    port,
+  );
 
-  await for (final request in server) {
-    if (request.uri.path == '/ws') {
-      final socket = await WebSocketTransformer.upgrade(request);
-      final clientId = _uuid.v4();
-      final client = ClientConnection(id: clientId, socket: socket);
-      clients[clientId] = client;
+  print('Game WS server listening on ws://0.0.0.0:$port/ws');
 
-      print('Client connected: $clientId');
-
-      socket.listen(
-        (data) => _handleMessage(client, data),
-        onDone: () => _handleDisconnect(client),
-        onError: (err, st) {
-          print('Socket error for client $clientId: $err');
-          _handleDisconnect(client);
-        },
-      );
+  await for (final HttpRequest req in server) {
+    if (req.uri.path == '/ws') {
+      try {
+        final socket = await WebSocketTransformer.upgrade(req);
+        _handleWsClient(socket);
+      } catch (e, st) {
+        print('WebSocket upgrade error: $e\n$st');
+        req.response
+          ..statusCode = HttpStatus.internalServerError
+          ..write('WebSocket upgrade error')
+          ..close();
+      }
     } else {
-      // Простая проверка, что сервер жив
-      request.response
-        ..statusCode = 200
-        ..headers.contentType = ContentType.html
-        ..write('<h1>Game server is alive</h1>')
+      req.response
+        ..statusCode = HttpStatus.ok
+        ..headers.set('Content-Type', 'text/plain; charset=utf-8')
+        ..write('Game server is running.\nUse WebSocket at /ws.')
         ..close();
     }
   }
-}
-
-/// Разбор входящих сообщений
-void _handleMessage(ClientConnection client, dynamic data) {
-  try {
-    final raw = data is String ? data : utf8.decode(data as List<int>);
-    final msg = jsonDecode(raw) as Map<String, dynamic>;
-    final type = msg['type'] as String?;
-    final payload = (msg['payload'] as Map?)?.cast<String, dynamic>() ?? {};
-
-    if (type == null) {
-      _sendError(client, 'Missing message type');
-      return;
-    }
-
-    switch (type) {
-      case 'ping':
-        _send(client, {'type': 'pong', 'payload': {}});
-        break;
-
-      case 'create_game':
-        _handleCreateGame(client, payload);
-        break;
-
-      case 'join_as_host':
-        _handleJoinAsHost(client, payload);
-        break;
-
-      case 'join_as_player':
-        _handleJoinAsPlayer(client, payload);
-        break;
-
-      case 'join_as_screen':
-        _handleJoinAsScreen(client, payload);
-        break;
-
-      case 'start_game':
-        _handleStartGame(client, payload);
-        break;
-
-      case 'roll_dice_auto':
-        _handleRollDice(client, auto: true, payload: payload);
-        break;
-
-      case 'roll_dice_manual':
-        _handleRollDice(client, auto: false, payload: payload);
-        break;
-
-      case 'next_turn':
-        _handleNextTurn(client, payload);
-        break;
-
-      case 'add_comment':
-        _handleAddComment(client, payload);
-        break;
-
-      default:
-        _sendError(client, 'Unknown message type: $type');
-    }
-  } catch (e, st) {
-    print('Error handling message: $e\n$st');
-    _sendError(client, 'Invalid message format');
-  }
-}
-
-GameInstance _getGameOrThrow(ClientConnection client) {
-  final gameId = client.gameId;
-  if (gameId == null || !games.containsKey(gameId)) {
-    throw StateError('Game not found for client');
-  }
-  return games[gameId]!;
-}
-
-void _handleCreateGame(ClientConnection client, Map<String, dynamic> payload) {
-  final templateId = payload['templateId'] as String? ?? 'default_template';
-
-  final gameId = generateId();
-  final code = gameId.substring(0, 6).toUpperCase();
-
-  final game = GameInstance(
-    id: gameId,
-    templateId: templateId,
-    code: code,
-  );
-  games[gameId] = game;
-
-  client.gameId = gameId;
-  client.role = ClientRole.host;
-  game.hostClientId = client.id;
-
-  print('Game created: $gameId / code=$code');
-
-  _send(client, {
-    'type': 'game_created',
-    'payload': {
-      'gameId': gameId,
-      'code': code,
-      'templateId': templateId,
-    },
-  });
-
-  _sendRoomStateTo(client);
-}
-
-void _handleJoinAsHost(
-  ClientConnection client,
-  Map<String, dynamic> payload,
-) {
-  final code = (payload['code'] as String? ?? '').toUpperCase();
-  final game = games.values.firstWhere(
-    (g) => g.code == code,
-    orElse: () => throw StateError('Game with code $code not found'),
-  );
-
-  client.gameId = game.id;
-  client.role = ClientRole.host;
-  game.hostClientId = client.id;
-
-  print('Client ${client.id} joined as host to game ${game.id}');
-
-  _sendRoomStateTo(client);
-}
-
-void _handleJoinAsPlayer(
-  ClientConnection client,
-  Map<String, dynamic> payload,
-) {
-  final code = (payload['code'] as String? ?? '').toUpperCase();
-  final name = (payload['name'] as String? ?? 'Участница').trim();
-  if (code.isEmpty) {
-    _sendError(client, 'Missing game code');
-    return;
-  }
-  final game = games.values.firstWhere(
-    (g) => g.code == code,
-    orElse: () => throw StateError('Game with code $code not found'),
-  );
-
-  client.gameId = game.id;
-  client.role = ClientRole.player;
-
-  final player = game.addPlayer(name);
-  client.playerId = player.id;
-
-  game.addEvent(
-    GameEvent(
-      id: generateId(),
-      timestamp: DateTime.now(),
-      type: 'player_joined',
-      actorRole: 'player',
-      actorId: player.id,
-      payload: {'name': player.name},
-    ),
-  );
-
-  print(
-      'Client ${client.id} joined as player ${player.id} (${player.name}) to game ${game.id}');
-
-  _broadcastRoomState(game);
-}
-
-void _handleJoinAsScreen(
-  ClientConnection client,
-  Map<String, dynamic> payload,
-) {
-  final code = (payload['code'] as String? ?? '').toUpperCase();
-  final game = games.values.firstWhere(
-    (g) => g.code == code,
-    orElse: () => throw StateError('Game with code $code not found'),
-  );
-
-  client.gameId = game.id;
-  client.role = ClientRole.screen;
-  game.screenClientIds.add(client.id);
-
-  print('Client ${client.id} joined as screen to game ${game.id}');
-
-  _sendRoomStateTo(client);
-}
-
-void _handleStartGame(
-  ClientConnection client,
-  Map<String, dynamic> payload,
-) {
-  final game = _getGameOrThrow(client);
-  if (client.role != ClientRole.host) {
-    _sendError(client, 'Only host can start the game');
-    return;
-  }
-  if (game.players.isEmpty) {
-    _sendError(client, 'No players in game');
-    return;
-  }
-
-  game.startedAt = DateTime.now();
-  game.turnNumber = 1;
-
-  final next = game.nextTurnPlayer();
-  if (next == null) {
-    _sendError(client, 'No available players to start');
-    return;
-  }
-
-  game.currentPlayerId = next.id;
-  next.status = PlayerStatus.active;
-
-  game.addEvent(
-    GameEvent(
-      id: generateId(),
-      timestamp: DateTime.now(),
-      type: 'game_started',
-      actorRole: 'host',
-      actorId: null,
-      payload: {},
-    ),
-  );
-
-  _broadcastRoomState(game);
-}
-
-void _handleRollDice(
-  ClientConnection client, {
-  required bool auto,
-  required Map<String, dynamic> payload,
-}) {
-  final game = _getGameOrThrow(client);
-  if (game.currentPlayerId == null) {
-    _sendError(client, 'Game has not started yet');
-    return;
-  }
-
-  final currentPlayer = game.currentPlayer;
-  if (currentPlayer == null) {
-    _sendError(client, 'No current player');
-    return;
-  }
-
-  final isHost = client.role == ClientRole.host;
-  final isActivePlayer = client.role == ClientRole.player &&
-      client.playerId == currentPlayer.id &&
-      currentPlayer.status == PlayerStatus.active;
-
-  if (!isHost && !isActivePlayer) {
-    _sendError(client, 'Only host or active player can roll dice');
-    return;
-  }
-
-  int roll;
-  if (auto) {
-    roll = (Random().nextInt(6) + 1);
-  } else {
-    final value = payload['value'] as int? ?? 1;
-    roll = value.clamp(1, 6);
-  }
-
-  final oldPos = currentPlayer.position;
-  final newPos = oldPos + roll; // пока без поля: просто двигаем вперёд
-
-  currentPlayer.position = newPos;
-  game.selectedCellId = newPos;
-  game.lastDiceValue = roll;
-
-  game.addEvent(
-    GameEvent(
-      id: generateId(),
-      timestamp: DateTime.now(),
-      type: 'dice_rolled',
-      actorRole: isHost ? 'host' : 'player',
-      actorId: isHost ? null : currentPlayer.id,
-      payload: {
-        'roll': roll,
-        'from': oldPos,
-        'to': newPos,
-      },
-    ),
-  );
-
-  _broadcastRoomState(game);
-}
-
-void _handleNextTurn(
-  ClientConnection client,
-  Map<String, dynamic> payload,
-) {
-  final game = _getGameOrThrow(client);
-  if (game.currentPlayerId == null) {
-    _sendError(client, 'Game has not started');
-    return;
-  }
-
-  final currentPlayer = game.currentPlayer;
-  if (currentPlayer == null) {
-    _sendError(client, 'No current player');
-    return;
-  }
-
-  final isHost = client.role == ClientRole.host;
-  final isActivePlayer = client.role == ClientRole.player &&
-      client.playerId == currentPlayer.id &&
-      currentPlayer.status == PlayerStatus.active;
-
-  if (!isHost && !isActivePlayer) {
-    _sendError(client, 'Only host or active player can end the turn');
-    return;
-  }
-
-  // Здесь можно вставить логику: если дошла до последней клетки -> finished
-  // Пока просто переводим в waiting
-  if (currentPlayer.status == PlayerStatus.active) {
-    currentPlayer.status = PlayerStatus.waiting;
-  }
-
-  final next = game.nextTurnPlayer();
-  if (next == null) {
-    // Все, кто мог ходить, закончились -> считаем игру завершённой
-    game.status = 'finished';
-    game.finishedAt = DateTime.now();
-
-    game.addEvent(
-      GameEvent(
-        id: generateId(),
-        timestamp: DateTime.now(),
-        type: 'game_finished',
-        actorRole: isHost ? 'host' : 'player',
-        actorId: isHost ? null : currentPlayer.id,
-        payload: {},
-      ),
-    );
-    _broadcastRoomState(game);
-    return;
-  }
-
-  game.turnNumber += 1;
-  game.currentPlayerId = next.id;
-  next.status = PlayerStatus.active;
-
-  game.addEvent(
-    GameEvent(
-      id: generateId(),
-      timestamp: DateTime.now(),
-      type: 'turn_changed',
-      actorRole: isHost ? 'host' : 'player',
-      actorId: isHost ? null : currentPlayer.id,
-      payload: {
-        'fromPlayerId': currentPlayer.id,
-        'toPlayerId': next.id,
-        'turnNumber': game.turnNumber,
-      },
-    ),
-  );
-
-  _broadcastRoomState(game);
-}
-
-void _handleAddComment(
-  ClientConnection client,
-  Map<String, dynamic> payload,
-) {
-  final game = _getGameOrThrow(client);
-  final text = (payload['text'] as String? ?? '').trim();
-  if (text.isEmpty) {
-    _sendError(client, 'Comment text is empty');
-    return;
-  }
-
-  String? actorRole;
-  String? actorId;
-
-  switch (client.role) {
-    case ClientRole.host:
-      actorRole = 'host';
-      break;
-    case ClientRole.player:
-      actorRole = 'player';
-      actorId = client.playerId;
-      break;
-    case ClientRole.screen:
-      actorRole = 'screen';
-      break;
-    default:
-      actorRole = 'unknown';
-  }
-
-  game.addEvent(
-    GameEvent(
-      id: generateId(),
-      timestamp: DateTime.now(),
-      type: 'comment_added',
-      actorRole: actorRole,
-      actorId: actorId,
-      payload: {'text': text},
-    ),
-  );
-
-  _broadcastRoomState(game);
-}
-
-/// Рассылка состояния комнаты
-void _broadcastRoomState(GameInstance game) {
-  final payload = game.toJson();
-  final message = jsonEncode({
-    'type': 'room_state',
-    'payload': payload,
-  });
-
-  for (final c in clients.values) {
-    if (c.gameId == game.id) {
-      c.socket.add(message);
-    }
-  }
-}
-
-/// Отправить состояние конкретному клиенту
-void _sendRoomStateTo(ClientConnection client) {
-  final game = _getGameOrThrow(client);
-  final payload = game.toJson();
-  _send(client, {
-    'type': 'room_state',
-    'payload': payload,
-  });
-}
-
-void _send(ClientConnection client, Map<String, dynamic> msg) {
-  try {
-    client.socket.add(jsonEncode(msg));
-  } catch (e) {
-    print('Error sending to client ${client.id}: $e');
-  }
-}
-
-void _sendError(ClientConnection client, String message) {
-  _send(client, {
-    'type': 'error',
-    'payload': {'message': message},
-  });
-}
-
-void _handleDisconnect(ClientConnection client) {
-  print('Client disconnected: ${client.id}');
-  final gameId = client.gameId;
-  final role = client.role;
-
-  if (gameId != null && games.containsKey(gameId)) {
-    final game = games[gameId]!;
-    if (role == ClientRole.screen) {
-      game.screenClientIds.remove(client.id);
-    } else if (role == ClientRole.host) {
-      if (game.hostClientId == client.id) {
-        game.hostClientId = null;
-      }
-    }
-    // игроков пока не удаляем, считаем, что они могут переподключиться
-  }
-
-  clients.remove(client.id);
 }
